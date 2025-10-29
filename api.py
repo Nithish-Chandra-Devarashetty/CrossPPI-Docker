@@ -1,23 +1,25 @@
-from datetime import datetime
-from flask import Flask, Response, request, jsonify
+from flask import Flask, request, jsonify, Response
 import torch
-import torch.nn as nn
+import os
+import json
+import traceback
+import shutil
+from datetime import datetime
 from src.protein_processor import ProteinInference
 from src.model import Protein_feature_extraction, cross_attention
+import torch.nn as nn
 
-# Device configuration
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+app = Flask(__name__)
 
+UPLOAD_FOLDER = 'src/data/input'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
 hidden_dim = 128
 
-# -----------------------------
-# Define PPI Model
-# -----------------------------
+# -------------------------------
+# PPI Model Definition
+# -------------------------------
 class PPI(nn.Module):
     def __init__(self):
         super(PPI, self).__init__()
@@ -40,7 +42,7 @@ class PPI(nn.Module):
         ligand_out_seq, ligand_out_graph, ligand_mask_seq, ligand_mask_graph, ligand_seq_final, ligand_graph_final = self.ligand_graph_model(ligand_batch, device)
         receptor_out_seq, receptor_out_graph, receptor_mask_seq, receptor_mask_graph, receptor_seq_final, receptor_graph_final = self.receptor_graph_model(receptor_batch, device)
 
-        context_layer, attention_score = self.cross_attention(
+        context_layer, _ = self.cross_attention(
             [ligand_out_seq, ligand_out_graph, receptor_out_seq, receptor_out_graph],
             [ligand_mask_seq, ligand_mask_graph, receptor_mask_seq, receptor_mask_graph],
             device
@@ -70,130 +72,92 @@ class PPI(nn.Module):
         out = self.line3(out)
         return out
 
+# -------------------------------
+# Load Pretrained Ensemble Models
+# -------------------------------
+model_paths = [
+    "srcsave/model_cv_(t300(5_fold))2_1_1.pth",
+    "src/save/model_cv_(t300(5_fold))2_2_1.pth",
+    "src/save/model_cv_(t300(5_fold))2_3_1.pth",
+    "src/save/model_cv_(t300(5_fold))2_4_1.pth",
+    "src/save/model_cv_(t300(5_fold))2_5_1.pth"
+]
 
-# -----------------------------
-# Flask App Initialization
-# -----------------------------
-app = Flask(__name__)
-
-# -----------------------------
-# Load Pretrained Models
-# -----------------------------
-def _load_checkpoint_with_key_remap(model: nn.Module, ckpt_path: str, device: torch.device):
-    """Load a checkpoint while remapping legacy key names to current model.
-
-    - Renames 'rna' -> 'ligand' and 'mole' -> 'receptor' in cross-attention blocks
-    - Strips an optional leading 'module.' (from DataParallel)
-    - Loads with strict=False so non-matching keys don't crash the app
-    """
-    state = torch.load(ckpt_path, map_location=device)
-    # Some checkpoints wrap the state_dict
-    if isinstance(state, dict) and 'state_dict' in state and isinstance(state['state_dict'], dict):
-        state = state['state_dict']
-
-    if not isinstance(state, dict):
-        raise RuntimeError(f"Unexpected checkpoint format in {ckpt_path}")
-
-    remapped = {}
-    for k, v in state.items():
-        new_k = k
-        if new_k.startswith('module.'):
-            new_k = new_k[len('module.'):]
-        # Remap legacy naming used in provided checkpoints
-        new_k = new_k.replace('rna', 'ligand')
-        new_k = new_k.replace('mole', 'receptor')
-        remapped[new_k] = v
-
-    incompatible = model.load_state_dict(remapped, strict=False)
-    # Log what didn't match to help debugging but don't crash
-    try:
-        missing = getattr(incompatible, 'missing_keys', [])
-        unexpected = getattr(incompatible, 'unexpected_keys', [])
-        if missing or unexpected:
-            print(f"Checkpoint load for {ckpt_path}: missing={len(missing)}, unexpected={len(unexpected)}")
-            if missing:
-                print(f"Missing keys (first 10): {missing[:10]}")
-            if unexpected:
-                print(f"Unexpected keys (first 10): {unexpected[:10]}")
-    except Exception:
-        # Older torch may return None when strict=False; ignore
-        pass
+models = []
+for path in model_paths:
+    model = PPI().to(device)
+    model.load_state_dict(torch.load(path, map_location=device))
     model.eval()
-    return model
+    models.append(model)
 
-try:
-    model1 = PPI().to(device)
-    model2 = PPI().to(device)
-    model3 = PPI().to(device)
-    model4 = PPI().to(device)
-    model5 = PPI().to(device)
+# -------------------------------
+# Inference Helper Function
+# -------------------------------
+def run_inference(ligand_seq: str, receptor_seq: str):
+    ligand = ProteinInference(sequence=ligand_seq)
+    receptor = ProteinInference(sequence=receptor_seq)
+    ligand_processed = ligand.process().to(device)
+    receptor_processed = receptor.process().to(device)
 
-    model1 = _load_checkpoint_with_key_remap(model1, "save/model_cv_(t300(5_fold))2_1_1.pth", device)
-    model2 = _load_checkpoint_with_key_remap(model2, "save/model_cv_(t300(5_fold))2_2_1.pth", device)
-    model3 = _load_checkpoint_with_key_remap(model3, "save/model_cv_(t300(5_fold))2_3_1.pth", device)
-    model4 = _load_checkpoint_with_key_remap(model4, "save/model_cv_(t300(5_fold))2_4_1.pth", device)
-    model5 = _load_checkpoint_with_key_remap(model5, "save/model_cv_(t300(5_fold))2_5_1.pth", device)
-except Exception as e:
-    print(f"Error loading model weights: {e}")
-    raise
+    outputs = [m(ligand_processed, receptor_processed).item() for m in models]
+    avg_output = sum(outputs) / len(outputs)
+    return avg_output
 
-
-# -----------------------------
-# Inference Endpoint
-# -----------------------------
-@app.route('/predict', methods=['POST'])
-def predict():
+# -------------------------------
+# /score Endpoint
+# -------------------------------
+@app.route('/score', methods=['POST'])
+def score() -> Response:
+    reqId = None
     try:
-        # Input Validation
-        if not request.json or 'ligand' not in request.json or 'receptor' not in request.json:
-            return jsonify({'error': 'Missing "ligand" or "receptor" in request'}), 400
+        data = request.form
+        required_fields = ['reqId', 'ligand_seq', 'receptor_seq']
+        missing = [f for f in required_fields if f not in data]
+        if missing:
+            raise ValueError(f"Missing fields: {', '.join(missing)}")
 
-        ligand_seq = request.json['ligand']
-        receptor_seq = request.json['receptor']
+        reqId = data.get('reqId')
+        ligand_seq = data.get('ligand_seq')
+        receptor_seq = data.get('receptor_seq')
 
-        if not isinstance(ligand_seq, str) or not ligand_seq:
-            return jsonify({'error': 'Ligand must be a non-empty string'}), 400
-        if not isinstance(receptor_seq, str) or not receptor_seq:
-            return jsonify({'error': 'Receptor must be a non-empty string'}), 400
+        # Save input for traceability
+        with open(f"{UPLOAD_FOLDER}/{reqId}_input.json", "w") as f:
+            json.dump({'ligand_seq': ligand_seq, 'receptor_seq': receptor_seq}, f)
 
-        # Process input sequences
-        try:
-            ligand_proc = ProteinInference(sequence=ligand_seq).process()
-            receptor_proc = ProteinInference(sequence=receptor_seq).process()
-        except Exception as e:
-            return jsonify({'error': f'Error processing sequences: {str(e)}'}), 400
+        # Run inference
+        result = run_inference(ligand_seq, receptor_seq)
 
-        # Model inference (ensemble average)
-        with torch.no_grad():
-            preds = [
-                model1(ligand_proc.to(device), receptor_proc.to(device)).item(),
-                model2(ligand_proc.to(device), receptor_proc.to(device)).item(),
-                model3(ligand_proc.to(device), receptor_proc.to(device)).item(),
-                model4(ligand_proc.to(device), receptor_proc.to(device)).item(),
-                model5(ligand_proc.to(device), receptor_proc.to(device)).item(),
-            ]
-            final_pred = sum(preds) / len(preds)
-
-        return jsonify({'prediction': final_pred}), 200
+        return jsonify({
+            "message": "Inference completed successfully",
+            "reqId": reqId,
+            "predicted_affinity": result
+        }), 200
 
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        traceback.print_exc()
+        return jsonify({
+            "message": "Inference failed",
+            "error": str(e)
+        }), 500
 
+    finally:
+        if reqId:
+            for file in os.listdir(UPLOAD_FOLDER):
+                if file.startswith(reqId + "_"):
+                    os.remove(os.path.join(UPLOAD_FOLDER, file))
 
-# -----------------------------
-# Health Check Endpoint
-# -----------------------------
-@app.route('/health/<sample>', methods=['POST'])
+# -------------------------------
+# /health Endpoint
+# -------------------------------
+@app.route('/health/<sample>', methods=['GET'])
 def health(sample) -> Response:
     if sample == "hi":
         date = datetime.now().strftime("%H:%M:%S")
         return f"Hello {date}"
-    else:
-        return jsonify({'error': "Unauthorized access"})
+    return jsonify({'error': "Unauthorized access"}), 403
 
-
-# -----------------------------
-# Run App
-# -----------------------------
+# -------------------------------
+# Run Server
+# -------------------------------
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5060)
+    app.run(host='0.0.0.0', port=5000, debug=True)
