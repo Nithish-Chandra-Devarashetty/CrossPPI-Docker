@@ -29,4 +29,4 @@ RUN /bin/bash -c "source activate crossppi && pip install git+https://github.com
 EXPOSE 5060
 
 # Replace <env-name> with the name of your conda environment
-CMD [ "bash", "-lc", "source activate crossppi  && exec gunicorn api:app -b 0.0.0.0:5060 --workers=1 --pythonpath /usr/src/app/src" ]
+CMD [ "bash", "-lc", "source activate crossppi  && exec gunicorn server:app -b 0.0.0.0:5060 --workers=1 --pythonpath /usr/src/app/src" ]
