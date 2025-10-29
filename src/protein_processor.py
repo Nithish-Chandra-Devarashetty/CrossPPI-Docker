@@ -17,36 +17,16 @@ class ESMEmbedder:
         self.model_name = model_name
         self.device = device
 
-        loaded = False
-        # Try local checkpoint first
-        if os.path.isfile(self.model_path):
-            logger.info(f"Loading ESM from local checkpoint: path={self.model_path}")
-            try:
-                model_data = torch.load(self.model_path, map_location="cpu")
-                # load_model_and_alphabet_core expects the checkpoint dict
-                self.model, self.alphabet = esm.pretrained.load_model_and_alphabet_core(self.model_name, model_data)
-                loaded = True
-            except Exception as e:
-                logger.warning(f"Failed to load local checkpoint '{self.model_path}': {e}")
+        # Strict: require local checkpoint and do not attempt any downloads
+        if not os.path.isfile(self.model_path):
+            raise FileNotFoundError(
+                f"ESM checkpoint not found at '{self.model_path}'. Place the file there or set ESM_MODEL_PATH."
+            )
 
-        if not loaded:
-            logger.info(f"Local checkpoint not found/failed. Attempting to load '{self.model_name}' from esm hub (this will download if needed).")
-            try:
-                # Prefer model-specific helper if present (e.g. esm.pretrained.esm2_t6_8M_UR50D)
-                if hasattr(esm.pretrained, self.model_name):
-                    self.model, self.alphabet = getattr(esm.pretrained, self.model_name)()
-                else:
-                    # Fallback to hub loader which accepts a model name
-                    # (some esm versions expose load_model_and_alphabet_hub)
-                    try:
-                        self.model, self.alphabet = esm.pretrained.load_model_and_alphabet_hub(self.model_name)
-                    except Exception:
-                        # Last fallback: try the generic esm.pretrained API if available
-                        self.model, self.alphabet = esm.pretrained.esm2_t6_8M_UR50D()
-                loaded = True
-            except Exception as e:
-                logger.error(f"Failed to load ESM model '{self.model_name}' from hub: {e}")
-                raise
+        logger.info(f"Loading ESM from local checkpoint: name={self.model_name}, path={self.model_path}")
+        model_data = torch.load(self.model_path, map_location="cpu")
+        # load_model_and_alphabet_core expects the checkpoint dict
+        self.model, self.alphabet = esm.pretrained.load_model_and_alphabet_core(self.model_name, model_data)
 
         # setup converter, eval and device
         self.batch_converter = self.alphabet.get_batch_converter()
