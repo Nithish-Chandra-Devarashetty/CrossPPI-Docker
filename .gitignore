@@ -1,0 +1,14 @@
+# Ignore local model checkpoints and large binaries
+src/data/input/*.pt
+src/data/input/*.pth
+save/*.pt
+save/*.pth
+# Conda/env artifacts
+*.conda
+*.tar.bz2
+# Bytecode
+__pycache__/
+*.py[cod]
+# OS files
+.DS_Store
+Thumbs.db

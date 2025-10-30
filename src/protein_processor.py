@@ -48,8 +48,15 @@ class ESMEmbedder:
         batch_tokens = batch_tokens.to(self.device)
         with torch.no_grad():
             results = self.model(batch_tokens, repr_layers=[self.repr_layer], return_contacts=False)
-        rep = results["representations"][self.repr_layer][0, 1:-1].cpu().numpy()
-        return rep
+        rep_t = results["representations"][self.repr_layer][0, 1:-1]
+        # Enforce 1280-dim embeddings (required by downstream model, see line_emb input)
+        feat_dim = rep_t.shape[-1]
+        if feat_dim != 1280:
+            raise ValueError(
+                f"ESM embedding dimension {feat_dim} != expected 1280. "
+                f"Use a 1280-dim model (e.g., 'esm2_t33_650M_UR50D') and set ESM_MODEL_PATH to its local .pt."
+            )
+        return rep_t.cpu().numpy()
 
     def contact_map(self, seq: str) -> np.ndarray:
         """Try to get contact map from ESM; if unavailable, use simple chain adjacency."""
@@ -81,14 +88,19 @@ def get_global_embedder() -> ESMEmbedder:
     """Return a singleton ESMEmbedder loaded from a local checkpoint.
 
     Env vars:
-      - ESM_MODEL_PATH: path to .pt (default 'src/data/input/esm2_t6_8M_UR50D.pt')
-      - ESM_MODEL_NAME: esm model key (default 'esm2_t6_8M_UR50D')
+      - ESM_MODEL_PATH: path to .pt (default 'src/data/input/esm2_t33_650M_UR50D.pt')
+      - ESM_MODEL_NAME: esm model key (default 'esm2_t33_650M_UR50D')
       - ESM_DEVICE: 'cuda' or 'cpu' (default auto)
     """
     global _EMBEDDER_SINGLETON
     if _EMBEDDER_SINGLETON is None:
-        default_path = os.getenv("ESM_MODEL_PATH", os.path.join("src", "data", "input", "esm2_t6_8M_UR50D.pt"))
-        model_name = os.getenv("ESM_MODEL_NAME", "esm2_t6_8M_UR50D")
+        default_path = os.getenv("ESM_MODEL_PATH", os.path.join("src", "data", "input", "esm2_t33_650M_UR50D.pt"))
+        # If the .pt file isn't present but a .pth exists with same basename, use it.
+        if not os.path.isfile(default_path) and default_path.endswith('.pt'):
+            alt_path = default_path[:-3] + 'pth'
+            if os.path.isfile(alt_path):
+                default_path = alt_path
+        model_name = os.getenv("ESM_MODEL_NAME", "esm2_t33_650M_UR50D")
         dev_env = os.getenv("ESM_DEVICE", "auto").lower()
         if dev_env == "cuda" or (dev_env == "auto" and torch.cuda.is_available()):
             device = "cuda"
