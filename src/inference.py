@@ -1,11 +1,14 @@
+import os
+import logging
 import torch
 import torch.nn as nn
-import os
 from src.protein_processor import ProteinInference
 from src.model import Protein_feature_extraction, cross_attention
 
-device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
+# Device selection (use default CUDA device if available)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 hidden_dim = 128
+log = logging.getLogger(__name__)
 
 # -------------------------------
 # PPI Model Definition
@@ -66,21 +69,64 @@ class PPI(nn.Module):
 # -------------------------------
 # Load Ensemble Models
 # -------------------------------
+def _remap_state_dict_keys(sd: dict) -> dict:
+    """Map rna/mole -> ligand/receptor and strip optional 'module.' prefixes."""
+    out = {}
+    for k, v in sd.items():
+        k2 = k[7:] if k.startswith("module.") else k
+        # Specific replacements first
+        k2 = (k2
+              .replace("query_rna", "query_ligand")
+              .replace("key_rna", "key_ligand")
+              .replace("value_rna", "value_ligand")
+              .replace("dense_rna", "dense_ligand")
+              .replace("query_mole", "query_receptor")
+              .replace("key_mole", "key_receptor")
+              .replace("value_mole", "value_receptor")
+              .replace("dense_mole", "dense_receptor"))
+        # Broad safety net
+        k2 = k2.replace(".rna.", ".ligand.").replace(".mole.", ".receptor.")
+        out[k2] = v
+    return out
+
+
+def _load_weights_compat(model: nn.Module, ckpt_path: str, dev: torch.device):
+    ckpt = torch.load(ckpt_path, map_location=dev)
+    sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    sd = _remap_state_dict_keys(sd)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing:
+        preview = ", ".join(list(missing)[:20])
+        log.warning("Missing keys (%d): %s%s", len(missing), preview, " ..." if len(missing) > 20 else "")
+    if unexpected:
+        preview = ", ".join(list(unexpected)[:20])
+        log.warning("Unexpected keys (%d): %s%s", len(unexpected), preview, " ..." if len(unexpected) > 20 else "")
+    model.eval()
+    return model
+
+
 def load_models():
-    model_paths = [
-        "checkpoints/model_cv_(t300(5_fold))2_1_1.pth",
-        "checkpoints/model_cv_(t300(5_fold))2_2_1.pth",
-        "checkpoints/model_cv_(t300(5_fold))2_3_1.pth",
-        "checkpoints/model_cv_(t300(5_fold))2_4_1.pth",
-        "checkpoints/model_cv_(t300(5_fold))2_5_1.pth"
+    # Resolve checkpoint directory relative to this file
+    base_dir = os.path.dirname(__file__)
+    ckpt_dir = os.path.join(base_dir, "checkpoints")
+    filenames = [
+        "model_cv_(t300(5_fold))2_1_1.pth",
+        "model_cv_(t300(5_fold))2_2_1.pth",
+        "model_cv_(t300(5_fold))2_3_1.pth",
+        "model_cv_(t300(5_fold))2_4_1.pth",
+        "model_cv_(t300(5_fold))2_5_1.pth",
     ]
+    paths = [os.path.join(ckpt_dir, f) for f in filenames]
+
+    for p in paths:
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"Missing weight file: {p}")
 
     models = []
-    for path in model_paths:
-        model = PPI().to(device)
-        model.load_state_dict(torch.load(path, map_location=device))
-        model.eval()
-        models.append(model)
+    for p in paths:
+        m = PPI().to(device)
+        _load_weights_compat(m, p, device)
+        models.append(m)
     return models
 
 
